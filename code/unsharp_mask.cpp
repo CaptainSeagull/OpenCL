@@ -32,7 +32,7 @@ static void run_kernel(cl_command_queue cmds, cl_kernel ker) {
     arg_cnt = 0;
 }
 
-static void do_blur(OpenCLStuff res, cl_mem dst, cl_mem src, int blur_radius, int unsigned w, int unsigned h, int unsigned nchannels) {
+static void do_blur(OpenCLStuff res, cl_mem dst, cl_mem src, int blur_radius, int w, int h, int nchannels) {
     int err = 0;
 
     set_argument_helper(res.ko_blur, dst);
@@ -46,25 +46,27 @@ static void do_blur(OpenCLStuff res, cl_mem dst, cl_mem src, int blur_radius, in
 }
 
 static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius,
-                         int unsigned w, int unsigned h, int unsigned nchannels, OpenCLStuff res) {
-    //
-    // Calculate Blur
-    //
+                         int w, int h, int nchannels, OpenCLStuff res) {
+    size_t size = w * h * nchannels;
     global_item_size[0] = w * nchannels;
     global_item_size[1] = h * nchannels;
 
     int err = 0;
 
+    //
+    // Calculate Blur
+    //
+
     // Create a copy of the original image in GPU memory.
-    cl_mem gpu_in = clCreateBuffer(res.context, CL_MEM_READ_ONLY,  w * h * nchannels, 0, &err);  checkError(err, "Error allocating memory.");
-    err = clEnqueueWriteBuffer(res.commands, gpu_in, CL_TRUE, 0, w * h * nchannels, in, 0, 0, 0); checkError(err, "Error copying original buffer from gpu to cpu");
+    cl_mem gpu_in = clCreateBuffer(res.context, CL_MEM_READ_WRITE, size, 0, &err);  checkError(err, "Error allocating memory.");
+    err = clEnqueueWriteBuffer(res.commands, gpu_in, CL_TRUE, 0, size, in, 0, 0, 0); checkError(err, "Error copying original buffer from gpu to cpu");
 
     // Allocate memory for the swap buffers.
-    cl_mem blur1 = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, 0, &err); checkError(err, "Creating blur buffer 1");
-    cl_mem blur2 = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, 0, &err); checkError(err, "Creating blur buffer 2");
+    cl_mem blur1 = clCreateBuffer(res.context, CL_MEM_READ_WRITE, size, 0, &err); checkError(err, "Creating blur buffer 1");
+    cl_mem blur2 = clCreateBuffer(res.context, CL_MEM_READ_WRITE, size, 0, &err); checkError(err, "Creating blur buffer 2");
 
     // Copy original to blur 1.
-    err = clEnqueueCopyBuffer(res.commands, gpu_in, blur1, 0, 0, w * h * nchannels, 0, 0, 0); checkError(err, "Copying original image to blur1");
+    err = clEnqueueCopyBuffer(res.commands, gpu_in, blur1, 0, 0, size, 0, 0, 0); checkError(err, "Copying original image to blur1");
 
     cl_mem final_blur = 0, gpu_out = 0;
 
@@ -75,13 +77,13 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
         cl_mem src = (is_even) ? blur1 : blur2;
         cl_mem dst = (is_even) ? blur2 : blur1;
 
+        // Set arguments then run kernel.
         set_argument_helper(res.ko_blur, dst);
         set_argument_helper(res.ko_blur, src);
         set_argument_helper(res.ko_blur, blur_radius);
         set_argument_helper(res.ko_blur, w);
         set_argument_helper(res.ko_blur, h);
         set_argument_helper(res.ko_blur, nchannels);
-
         run_kernel(res.commands, res.ko_blur);
 
         // Set the final blur to 1 or 2, depending on whether we finish on even or odd.
@@ -96,6 +98,8 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
     //
     // Add weighted
     //
+
+    // Set arguments then run kernel.
     set_argument_helper(res.ko_weighted, gpu_out);
     set_argument_helper(res.ko_weighted, gpu_in);
     set_argument_helper(res.ko_weighted, 1.5f);
@@ -105,11 +109,10 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
     set_argument_helper(res.ko_weighted, w);
     set_argument_helper(res.ko_weighted, h);
     set_argument_helper(res.ko_weighted, nchannels);
-
     run_kernel(res.commands, res.ko_weighted);
 
     // Copy memory from GPU to CPU.
-    err = clEnqueueReadBuffer(res.commands, gpu_out, CL_TRUE, 0, w * h * nchannels, out, 0, 0, 0);   checkError(err, "Reading back.");
+    err = clEnqueueReadBuffer(res.commands, gpu_out, CL_TRUE, 0, size, out, 0, 0, 0);   checkError(err, "Reading back.");
 
     // TODO(Jonny): Free opencl memory.
 }
@@ -120,7 +123,7 @@ static char const *opencl_blur =
 __kernel void pixel_average(__global unsigned char *out,
                             __global const unsigned char *in,
                             const int x, const int y, const int blur_radius,
-                            const unsigned w, const unsigned h, const unsigned nchannels) {
+                            const int w, const int h, const int nchannels) {
     float red_total = 0, green_total = 0, blue_total = 0;
     const unsigned nsamples = (blur_radius*2-1) * (blur_radius*2-1);
     for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {
@@ -142,8 +145,7 @@ __kernel void pixel_average(__global unsigned char *out,
 
 __kernel void blur(__global unsigned char *out, __global const unsigned char *in,
                    const int blur_radius,
-                   const unsigned w, const unsigned h, const unsigned nchannels)
-{
+                   const unsigned w, const unsigned h, const unsigned nchannels) {
     int x = get_global_id(0);
     int y = get_global_id(1);
     if((x <= w) && (y <= h)) {
@@ -272,12 +274,12 @@ int main(int argc, char *argv[]) {
     OpenCLStuff res = setup_opencl();
     if(res.success) {
 
-        const char *ifilename = argc > 1 ?           argv[1] : "lena.ppm";
-        const char *ofilename = argc > 2 ?           argv[2] : "out.ppm";
-        const int blur_radius = argc > 3 ? std::atoi(argv[3]) : 50;
+        char const *ifilename = (argc > 1) ? argv[1] : "ghost-town-8k.ppm";
+        char const *ofilename = (argc > 2) ? argv[2] : "out.ppm";
+        int blur_radius       = (argc > 3) ? std::atoi(argv[3]) : 50;
 
         ppm img;
-        std::vector<unsigned char> data_in, data_sharp;
+        std::vector<char unsigned> data_in, data_sharp;
 
         img.read(ifilename, data_in);
         data_sharp.resize(img.w * img.h * img.nchannels);
