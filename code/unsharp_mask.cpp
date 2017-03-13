@@ -1,5 +1,6 @@
 #include <chrono>
 #include <climits>
+#include <sstream>
 #include "cl/cl.h"
 #include "err_code.h"
 
@@ -46,7 +47,7 @@ static void do_blur(OpenCLStuff res, cl_mem dst, cl_mem src, int blur_radius, in
 }
 
 static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius,
-                         int w, int h, int nchannels, OpenCLStuff res) {
+                         int w, int h, int nchannels, OpenCLStuff res, int blur_times) {
     size_t size = w * h * nchannels;
     global_item_size[0] = w * nchannels;
     global_item_size[1] = h * nchannels;
@@ -71,7 +72,7 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
     cl_mem final_blur = 0, gpu_out = 0;
 
     // Do the blur n times.
-    for(int i = 0, n = 3; (i < n); ++i) {
+    for(int i = 0, n = blur_times; (i < n); ++i) {
         bool is_even = !(i &1);
 
         cl_mem src = (is_even) ? blur1 : blur2;
@@ -112,75 +113,68 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
     run_kernel(res.commands, res.ko_weighted);
 
     // Copy memory from GPU to CPU.
-    err = clEnqueueReadBuffer(res.commands, gpu_out, CL_TRUE, 0, size, out, 0, 0, 0);   checkError(err, "Reading back.");
+    err = clEnqueueReadBuffer(res.commands, gpu_out, CL_TRUE, 0, size, out, 0, 0, 0); checkError(err, "Reading back.");
 
     // TODO(Jonny): Free opencl memory.
 }
 
 static char const *opencl_blur =
-    R"(
-
-__kernel void pixel_average(__global unsigned char *out,
-                            __global const unsigned char *in,
-                            const int x, const int y, const int blur_radius,
-                            const int w, const int h, const int nchannels) {
-    float red_total = 0, green_total = 0, blue_total = 0;
-    const unsigned nsamples = (blur_radius*2-1) * (blur_radius*2-1);
-    for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {
-        for(int i = x-blur_radius+1; i < x+blur_radius; ++i) {
-            const unsigned r_i = i < 0 ? 0 : i >= w ? w-1 : i;
-            const unsigned r_j = j < 0 ? 0 : j >= h ? h-1 : j;
-            unsigned byte_offset = (r_j*w+r_i)*nchannels;
-            red_total   += in[byte_offset + 0];
-            green_total += in[byte_offset + 1];
-            blue_total  += in[byte_offset + 2];
-        }
-    }
-
-    unsigned byte_offset = (y*w+x)*nchannels;
-    out[byte_offset + 0] = (char unsigned)(red_total   / nsamples);
-    out[byte_offset + 1] = (char unsigned)(green_total / nsamples);
-    out[byte_offset + 2] = (char unsigned)(blue_total  / nsamples);
-}
-
-__kernel void blur(__global unsigned char *out, __global const unsigned char *in,
-                   const int blur_radius,
-                   const unsigned w, const unsigned h, const unsigned nchannels) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if((x <= w) && (y <= h)) {
-        pixel_average(out, in, x, y, blur_radius, w, h, nchannels);
-    }
-}
-
-)";
+    "__kernel void pixel_average(__global unsigned char *out,\n"
+    "                            __global const unsigned char *in,\n"
+    "                            const int x, const int y, const int blur_radius,\n"
+    "                            const int w, const int h, const int nchannels) {\n"
+    "    float red_total = 0, green_total = 0, blue_total = 0;\n"
+    "    const unsigned nsamples = (blur_radius*2-1) * (blur_radius*2-1);\n"
+    "    for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {\n"
+    "        for(int i = x-blur_radius+1; i < x+blur_radius; ++i) {\n"
+    "            const unsigned r_i = i < 0 ? 0 : i >= w ? w-1 : i;\n"
+    "            const unsigned r_j = j < 0 ? 0 : j >= h ? h-1 : j;\n"
+    "            unsigned byte_offset = (r_j*w+r_i)*nchannels;\n"
+    "            red_total   += in[byte_offset + 0];\n"
+    "            green_total += in[byte_offset + 1];\n"
+    "            blue_total  += in[byte_offset + 2];\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    unsigned byte_offset = (y*w+x)*nchannels;\n"
+    "    out[byte_offset + 0] = (char unsigned)(red_total   / nsamples);\n"
+    "    out[byte_offset + 1] = (char unsigned)(green_total / nsamples);\n"
+    "    out[byte_offset + 2] = (char unsigned)(blue_total  / nsamples);\n"
+    "}\n"
+    "\n"
+    "__kernel void blur(__global unsigned char *out, __global const unsigned char *in,\n"
+    "                   const int blur_radius,\n"
+    "                   const unsigned w, const unsigned h, const unsigned nchannels) {\n"
+    "    int x = get_global_id(0);\n"
+    "    int y = get_global_id(1);\n"
+    "    if((x <= w) && (y <= h)) {\n"
+    "        pixel_average(out, in, x, y, blur_radius, w, h, nchannels);\n"
+    "    }\n"
+    "}\n";
 
 
 // Calculates the weighted sum of two arrays, in1 and in2 according
 // to the formula: out(I) = saturate(in1(I)*alpha + in2(I)*beta + gamma)
 static char const *opencl_add_weighted =
-    R"(
-__kernel void add_weighted(__global unsigned char *out,
-                           __global const unsigned char *in1, const float alpha,
-                           __global const unsigned char *in2, const float  beta, const float gamma,
-                           const unsigned w, const unsigned h, const unsigned nchannels) {
-    int x = get_global_id(0);
-    int y = get_global_id(1);
-    if((x < w) && (y < h)) {
-        unsigned byte_offset = (y * w + x) * nchannels;
-
-        float tmp = in1[byte_offset + 0] * alpha + in2[byte_offset + 0] * beta + gamma;
-        out[byte_offset + 0] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);
-
-        tmp = in1[byte_offset + 1] * alpha + in2[byte_offset + 1] * beta + gamma;
-        out[byte_offset + 1] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);
-
-        tmp = in1[byte_offset + 2] * alpha + in2[byte_offset + 2] * beta + gamma;
-        out[byte_offset + 2] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);
-    }
-}
-
-)";
+    "__kernel void add_weighted(__global unsigned char *out,\n"
+    "                           __global const unsigned char *in1, const float alpha,\n"
+    "                           __global const unsigned char *in2, const float  beta, const float gamma,\n"
+    "                           const unsigned w, const unsigned h, const unsigned nchannels) {\n"
+    "    int x = get_global_id(0);\n"
+    "    int y = get_global_id(1);\n"
+    "    if((x < w) && (y < h)) {\n"
+    "        unsigned byte_offset = (y * w + x) * nchannels;\n"
+    "\n"
+    "        float tmp = in1[byte_offset + 0] * alpha + in2[byte_offset + 0] * beta + gamma;\n"
+    "        out[byte_offset + 0] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
+    "\n"
+    "        tmp = in1[byte_offset + 1] * alpha + in2[byte_offset + 1] * beta + gamma;\n"
+    "        out[byte_offset + 1] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
+    "\n"
+    "        tmp = in1[byte_offset + 2] * alpha + in2[byte_offset + 2] * beta + gamma;\n"
+    "        out[byte_offset + 2] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
+    "    }\n"
+    "}\n";
 
 static OpenCLStuff setup_opencl() {
     int err, i;
@@ -273,26 +267,41 @@ static OpenCLStuff setup_opencl() {
 int main(int argc, char *argv[]) {
     OpenCLStuff res = setup_opencl();
     if(res.success) {
+        int i, blur_radius, blur_times;
+        char const *ifilename = "lena.ppm";
 
-        char const *ifilename = (argc > 1) ? argv[1] : "ghost-town-8k.ppm";
-        char const *ofilename = (argc > 2) ? argv[2] : "out.ppm";
-        int blur_radius       = (argc > 3) ? std::atoi(argv[3]) : 50;
+        i = 0;
+        blur_radius = 5;
+        blur_times = 3;
 
-        ppm img;
-        std::vector<char unsigned> data_in, data_sharp;
+        /*for(i = 0; (i < 5); )*/ {
+            /*for(blur_times = 1; (blur_times < 20); blur_times += 1)*/ {
+                /*for(blur_radius = 5; (blur_radius < 50); blur_radius += 5)*/ {
+                    ppm img;
+                    std::vector<char unsigned> data_in, data_sharp;
 
-        img.read(ifilename, data_in);
-        data_sharp.resize(img.w * img.h * img.nchannels);
+                    img.read(ifilename, data_in);
+                    data_sharp.resize(img.w * img.h * img.nchannels);
 
-        auto t1 = std::chrono::steady_clock::now();
+                    auto t1 = std::chrono::steady_clock::now();
 
-        unsharp_mask(data_sharp.data(), data_in.data(), blur_radius,
-                     img.w, img.h, img.nchannels, res);
+                    unsharp_mask(data_sharp.data(), data_in.data(), blur_radius,
+                                 img.w, img.h, img.nchannels, res, blur_times);
 
-        auto t2 = std::chrono::steady_clock::now();
-        std::cout << std::chrono::duration<double>(t2-t1).count() << " seconds.\n";
+                    auto t2 = std::chrono::steady_clock::now();
+                    std::cout << "Image " << std::to_string(i)                                                          << std::endl;
+                    std::cout << "    " << "Number of times blurred " << blur_times                                     << std::endl;
+                    std::cout << "    " << "Radius "                  << blur_radius                                    << std::endl;
+                    std::cout << "    " << "Time (seconds) "          << std::chrono::duration<double>(t2 - t1).count() << std::endl;
+                    std::cout << std::endl << std::endl;
 
-        img.write(ofilename, data_sharp);
+                    std::string ofilename = "out" + std::to_string(i) + ".ppm";
+                    img.write(ofilename.c_str(), data_sharp);
+
+                    ++i;
+                }
+            }
+        }
     }
 
     return(0);

@@ -54,7 +54,7 @@ struct ppm {
     std::string magic;
     std::string::size_type capacity;
     unsigned w, h, max;
-    const unsigned nchannels= 3;  // e.g. RGB; RGBA has 4 channels
+    const unsigned nchannels = 3;  // e.g. RGB; RGBA has 4 channels
 };
 
 // http://insanecoding.blogspot.co.uk/2011/11/how-to-read-in-file-in-c.html
