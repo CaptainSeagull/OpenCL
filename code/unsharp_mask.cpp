@@ -3,174 +3,115 @@
 #include "cl/cl.h"
 #include "err_code.h"
 
-// Apply an unsharp mask to the 24-bit PPM loaded from the file path of
-// the first input argument; then write the sharpened output to the file path
-// of the second argument. The third argument provides the blur radius.
-
 #include "ppm.hpp"
 
-#ifndef DEVICE
-    #define DEVICE CL_DEVICE_TYPE_DEFAULT
-#endif
-
-struct OpenCLRes {
+struct OpenCLStuff {
     bool success;
     cl_context context;
-    cl_kernel ko_blur;
-    cl_kernel ko_weighted;
+    cl_kernel ko_blur, ko_weighted;
     cl_command_queue commands;
 };
 
-void add_weighted(unsigned char *out,
-                  const unsigned char *in1, const float alpha,
-                  const unsigned char *in2, const float  beta, const float gamma,
-                  const unsigned w, const unsigned h, const unsigned nchannels) {
-    for(int x = 0; (x < w); ++x) {
-        for(int y = 0; (y < h); ++y) {
-            unsigned byte_offset = (y * w + x) * nchannels;
+static size_t global_item_size[2];
 
-            float tmp = in1[byte_offset + 0] * alpha + in2[byte_offset + 0] * beta + gamma;
-            out[byte_offset + 0] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);
-
-            tmp = in1[byte_offset + 1] * alpha + in2[byte_offset + 1] * beta + gamma;
-            out[byte_offset + 1] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);
-
-            tmp = in1[byte_offset + 2] * alpha + in2[byte_offset + 2] * beta + gamma;
-            out[byte_offset + 2] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);
-        }
-    }
-}
-#if 0
-// Averages the nsamples pixels within blur_radius of (x,y). Pixels which
-// would be outside the image, replicate the value at the image border.
-void pixel_average(unsigned char *out,
-                   const unsigned char *in,
-                   const int x, const int y, const int blur_radius,
-                   const unsigned w, const unsigned h, const unsigned nchannels) {
-    float red_total = 0, green_total = 0, blue_total = 0;
-    const unsigned nsamples = (blur_radius*2-1) * (blur_radius*2-1);
-    for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {
-        for(int i = x-blur_radius+1; i < x+blur_radius; ++i) {
-            const unsigned r_i = i < 0 ? 0 : i >= w ? w-1 : i;
-            const unsigned r_j = j < 0 ? 0 : j >= h ? h-1 : j;
-            unsigned byte_offset = (r_j*w+r_i)*nchannels;
-            red_total   += in[byte_offset + 0];
-            green_total += in[byte_offset + 1];
-            blue_total  += in[byte_offset + 2];
-        }
-    }
-
-    unsigned byte_offset = (y*w+x)*nchannels;
-    out[byte_offset + 0] = (char unsigned)(red_total   / nsamples);
-    out[byte_offset + 1] = (char unsigned)(green_total / nsamples);
-    out[byte_offset + 2] = (char unsigned)(blue_total  / nsamples);
+static int arg_cnt = 0;
+template<typename T> static void set_argument_helper(cl_kernel kernel, T var) {
+    int err = clSetKernelArg(kernel, arg_cnt++, sizeof(var), &var);
+    checkError(err, "clSetKernelArg");
 }
 
-void blur(unsigned char *out, const unsigned char *in,
-          const int blur_radius,
-          const unsigned w, const unsigned h, const unsigned nchannels) {
-    for(int y = 0; y < h; ++y) {
-        for(int x = 0; x < w; ++x) {
-            pixel_average(out,in,x,y,blur_radius,w,h,nchannels);
-        }
-    }
-}
-#endif
-
-void unsharp_mask(unsigned char *out, const unsigned char *in,
-                  const int blur_radius,
-                  const unsigned w, const unsigned h, const unsigned nchannels, OpenCLRes res) {
+static void run_kernel(cl_command_queue cmds, cl_kernel ker) {
     int err = 0;
 
+    err = clEnqueueNDRangeKernel(cmds, ker, 2, 0, global_item_size, 0, 0, 0, 0);
+    checkError(err, "Running kernel");
+
+    err = clFinish(cmds);
+    checkError(err, "Waiting for kernel to finish");
+
+    arg_cnt = 0;
+}
+
+static void do_blur(OpenCLStuff res, cl_mem dst, cl_mem src, int blur_radius, int unsigned w, int unsigned h, int unsigned nchannels) {
+    int err = 0;
+
+    set_argument_helper(res.ko_blur, dst);
+    set_argument_helper(res.ko_blur, src);
+    set_argument_helper(res.ko_blur, blur_radius);
+    set_argument_helper(res.ko_blur, w);
+    set_argument_helper(res.ko_blur, h);
+    set_argument_helper(res.ko_blur, nchannels);
+
+    run_kernel(res.commands, res.ko_blur);
+}
+
+static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius,
+                         int unsigned w, int unsigned h, int unsigned nchannels, OpenCLStuff res) {
     //
     // Calculate Blur
     //
-    char unsigned *host_blur3 = (char unsigned *)malloc(w * h * nchannels);
+    global_item_size[0] = w * nchannels;
+    global_item_size[1] = h * nchannels;
 
-    cl_mem blur1   = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, NULL, &err); checkError(err, "Creating blur buffers");
-    cl_mem blur2   = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, NULL, &err); checkError(err, "Creating blur buffers");
-    cl_mem blur3   = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, NULL, &err); checkError(err, "Creating blur buffers");
+    int err = 0;
 
-    cl_mem gpu_in  = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, NULL, &err);
-    checkError(err, "Creating blur buffers");
+    // Create a copy of the original image in GPU memory.
+    cl_mem gpu_in = clCreateBuffer(res.context, CL_MEM_READ_ONLY,  w * h * nchannels, 0, &err);  checkError(err, "Error allocating memory.");
+    err = clEnqueueWriteBuffer(res.commands, gpu_in, CL_TRUE, 0, w * h * nchannels, in, 0, 0, 0); checkError(err, "Error copying original buffer from gpu to cpu");
 
-    err = clEnqueueWriteBuffer(res.commands, gpu_in, CL_TRUE, 0, w * h * nchannels, in, 0, NULL, NULL);
-    checkError(err, "Copying");
+    // Allocate memory for the swap buffers.
+    cl_mem blur1 = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, 0, &err); checkError(err, "Creating blur buffer 1");
+    cl_mem blur2 = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, 0, &err); checkError(err, "Creating blur buffer 2");
 
-    size_t global_item_size[2] = { w * nchannels, h * nchannels};
+    // Copy original to blur 1.
+    err = clEnqueueCopyBuffer(res.commands, gpu_in, blur1, 0, 0, w * h * nchannels, 0, 0, 0); checkError(err, "Copying original image to blur1");
 
-    {
-        err = clSetKernelArg(res.ko_blur, 0, sizeof(cl_mem),   &blur1);       checkError(err, "Argument 0");
-        err = clSetKernelArg(res.ko_blur, 1, sizeof(cl_mem),   &gpu_in);      checkError(err, "Argument 1");
-        err = clSetKernelArg(res.ko_blur, 2, sizeof(int),      &blur_radius); checkError(err, "Argument 2");
-        err = clSetKernelArg(res.ko_blur, 3, sizeof(unsigned), &w);           checkError(err, "Argument 3");
-        err = clSetKernelArg(res.ko_blur, 4, sizeof(unsigned), &h);           checkError(err, "Argument 4");
-        err = clSetKernelArg(res.ko_blur, 5, sizeof(unsigned), &nchannels);   checkError(err, "Argument 5");
+    cl_mem final_blur = 0, gpu_out = 0;
 
-        err = clEnqueueNDRangeKernel(res.commands, res.ko_blur, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
-        checkError(err, "Running kernel");
+    // Do the blur n times.
+    for(int i = 0, n = 3; (i < n); ++i) {
+        bool is_even = !(i &1);
 
-        err = clFinish(res.commands);
-        checkError(err, "Waiting for kernel to finish");
-    }
+        cl_mem src = (is_even) ? blur1 : blur2;
+        cl_mem dst = (is_even) ? blur2 : blur1;
 
-    {
-        err = clSetKernelArg(res.ko_blur, 0, sizeof(cl_mem),   &blur2);       checkError(err, "Argument 0");
-        err = clSetKernelArg(res.ko_blur, 1, sizeof(cl_mem),   &blur1);       checkError(err, "Argument 1");
-        err = clSetKernelArg(res.ko_blur, 2, sizeof(int),      &blur_radius); checkError(err, "Argument 2");
-        err = clSetKernelArg(res.ko_blur, 3, sizeof(unsigned), &w);           checkError(err, "Argument 3");
-        err = clSetKernelArg(res.ko_blur, 4, sizeof(unsigned), &h);           checkError(err, "Argument 4");
-        err = clSetKernelArg(res.ko_blur, 5, sizeof(unsigned), &nchannels);   checkError(err, "Argument 5");
+        set_argument_helper(res.ko_blur, dst);
+        set_argument_helper(res.ko_blur, src);
+        set_argument_helper(res.ko_blur, blur_radius);
+        set_argument_helper(res.ko_blur, w);
+        set_argument_helper(res.ko_blur, h);
+        set_argument_helper(res.ko_blur, nchannels);
 
-        err = clEnqueueNDRangeKernel(res.commands, res.ko_blur, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
-        checkError(err, "Running kernel");
+        run_kernel(res.commands, res.ko_blur);
 
-        err = clFinish(res.commands);
-        checkError(err, "Waiting for kernel to finish");
-    }
-
-    {
-        err = clSetKernelArg(res.ko_blur, 0, sizeof(cl_mem),   &blur3);       checkError(err, "Argument 0");
-        err = clSetKernelArg(res.ko_blur, 1, sizeof(cl_mem),   &blur2);       checkError(err, "Argument 1");
-        err = clSetKernelArg(res.ko_blur, 2, sizeof(int),      &blur_radius); checkError(err, "Argument 2");
-        err = clSetKernelArg(res.ko_blur, 3, sizeof(unsigned), &w);           checkError(err, "Argument 3");
-        err = clSetKernelArg(res.ko_blur, 4, sizeof(unsigned), &h);           checkError(err, "Argument 4");
-        err = clSetKernelArg(res.ko_blur, 5, sizeof(unsigned), &nchannels);   checkError(err, "Argument 5");
-
-        err = clEnqueueNDRangeKernel(res.commands, res.ko_blur, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
-        checkError(err, "Running kernel");
-
-        err = clFinish(res.commands);
-        checkError(err, "Waiting for kernel to finish");
+        // Set the final blur to 1 or 2, depending on whether we finish on even or odd.
+        // But also set the final output memory buffer to the opposite one, to avoid the
+        // extra memory allocation later.
+        if(i == n - 1) {
+            final_blur = (is_even) ? blur2 : blur1;
+            gpu_out    = (is_even) ? blur1 : blur2;
+        }
     }
 
     //
     // Add weighted
     //
-    {
-        cl_mem gpu_out = clCreateBuffer(res.context,  CL_MEM_READ_ONLY,  w * h * nchannels, NULL, &err);
-        checkError(err, "Allocating out");
+    set_argument_helper(res.ko_weighted, gpu_out);
+    set_argument_helper(res.ko_weighted, gpu_in);
+    set_argument_helper(res.ko_weighted, 1.5f);
+    set_argument_helper(res.ko_weighted, final_blur);
+    set_argument_helper(res.ko_weighted, -0.5f);
+    set_argument_helper(res.ko_weighted, 0.0f);
+    set_argument_helper(res.ko_weighted, w);
+    set_argument_helper(res.ko_weighted, h);
+    set_argument_helper(res.ko_weighted, nchannels);
 
-        float a = 1.5f, b = -0.5f, c = 0.0f;
-        err = clSetKernelArg(res.ko_weighted, 0, sizeof(cl_mem), &gpu_out);   checkError(err, "Argument 0");
-        err = clSetKernelArg(res.ko_weighted, 1, sizeof(cl_mem), &gpu_in);    checkError(err, "Argument 1");
-        err = clSetKernelArg(res.ko_weighted, 2, sizeof(float),  &a);         checkError(err, "Argument 2");
-        err = clSetKernelArg(res.ko_weighted, 3, sizeof(cl_mem), &blur3);     checkError(err, "Argument 3");
-        err = clSetKernelArg(res.ko_weighted, 4, sizeof(float),  &b);         checkError(err, "Argument 4");
-        err = clSetKernelArg(res.ko_weighted, 5, sizeof(float),  &c);         checkError(err, "Argument 5");
-        err = clSetKernelArg(res.ko_weighted, 6, sizeof(int),    &w);         checkError(err, "Argument 6");
-        err = clSetKernelArg(res.ko_weighted, 7, sizeof(int),    &h);         checkError(err, "Argument 7");
-        err = clSetKernelArg(res.ko_weighted, 8, sizeof(int),    &nchannels); checkError(err, "Argument 8");
+    run_kernel(res.commands, res.ko_weighted);
 
-        err = clEnqueueNDRangeKernel(res.commands, res.ko_weighted, 2, NULL, global_item_size, NULL, 0, NULL, NULL);
-        checkError(err, "Running kernel");
+    // Copy memory from GPU to CPU.
+    err = clEnqueueReadBuffer(res.commands, gpu_out, CL_TRUE, 0, w * h * nchannels, out, 0, 0, 0);   checkError(err, "Reading back.");
 
-        err = clFinish(res.commands);
-        checkError(err, "Waiting for kernel to finish");
-
-        err = clEnqueueReadBuffer(res.commands, gpu_out, CL_TRUE, 0, w * h * nchannels, out, 0, NULL, NULL);
-        checkError(err, "Reading back.");
-    }
+    // TODO(Jonny): Free opencl memory.
 }
 
 static char const *opencl_blur =
@@ -239,7 +180,7 @@ __kernel void add_weighted(__global unsigned char *out,
 
 )";
 
-static OpenCLRes setup_opencl() {
+static OpenCLStuff setup_opencl() {
     int err, i;
     cl_uint numPlatforms;
     cl_device_id device_id = 0;
@@ -247,7 +188,7 @@ static OpenCLRes setup_opencl() {
     cl_program add_weighted_program;
     // compute kernel
 
-    OpenCLRes res = {};
+    OpenCLStuff res = {};
 
     // Find number of platforms
     err = clGetPlatformIDs(0, NULL, &numPlatforms);
@@ -264,7 +205,7 @@ static OpenCLRes setup_opencl() {
 
     // Secure a GPU
     for (i = 0; i < numPlatforms; i++) {
-        err = clGetDeviceIDs(Platform[i], DEVICE, 1, &device_id, NULL);
+        err = clGetDeviceIDs(Platform[i], CL_DEVICE_TYPE_DEFAULT, 1, &device_id, NULL);
         if (err == CL_SUCCESS) {
             break;
         }
@@ -328,12 +269,12 @@ static OpenCLRes setup_opencl() {
 }
 
 int main(int argc, char *argv[]) {
-    OpenCLRes res = setup_opencl();
+    OpenCLStuff res = setup_opencl();
     if(res.success) {
 
         const char *ifilename = argc > 1 ?           argv[1] : "lena.ppm";
         const char *ofilename = argc > 2 ?           argv[2] : "out.ppm";
-        const int blur_radius = argc > 3 ? std::atoi(argv[3]) : 5;
+        const int blur_radius = argc > 3 ? std::atoi(argv[3]) : 50;
 
         ppm img;
         std::vector<unsigned char> data_in, data_sharp;
