@@ -9,7 +9,7 @@
 //
 //
 //
-static bool use_gaussian_blur = true;
+static bool use_gaussian_blur = false;
 
 struct OpenCLStuff {
     bool success;
@@ -128,23 +128,23 @@ static char const *opencl_original_blur =
     "                            __global const unsigned char *in,\n"
     "                            const int x, const int y, const int blur_radius,\n"
     "                            const int w, const int h, const int nchannels) {\n"
-    "    float red_total = 0, green_total = 0, blue_total = 0;\n"
+    "    float total[4] = {0, 0, 0, 0};\n"
     "    const unsigned nsamples = (blur_radius*2-1) * (blur_radius*2-1);\n"
     "    for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {\n"
     "        for(int i = x-blur_radius+1; i < x+blur_radius; ++i) {\n"
     "            const unsigned r_i = i < 0 ? 0 : i >= w ? w-1 : i;\n"
     "            const unsigned r_j = j < 0 ? 0 : j >= h ? h-1 : j;\n"
     "            unsigned byte_offset = (r_j*w+r_i)*nchannels;\n"
-    "            red_total   += in[byte_offset + 0];\n"
-    "            green_total += in[byte_offset + 1];\n"
-    "            blue_total  += in[byte_offset + 2];\n"
+    "            for(int channel_index = 0; (channel_index < nchannels); ++channel_index) {\n"
+    "                total[channel_index] += in[byte_offset + channel_index];\n"
+    "            }\n"
     "        }\n"
     "    }\n"
     "\n"
     "    unsigned byte_offset = (y*w+x)*nchannels;\n"
-    "    out[byte_offset + 0] = (char unsigned)(red_total   / nsamples);\n"
-    "    out[byte_offset + 1] = (char unsigned)(green_total / nsamples);\n"
-    "    out[byte_offset + 2] = (char unsigned)(blue_total  / nsamples);\n"
+    "    for(int channel_index = 0; (channel_index < nchannels); ++channel_index) {\n"
+    "        out[byte_offset + channel_index] = (char unsigned)(total[channel_index] / nsamples);\n"
+    "    }\n"
     "}\n"
     "\n"
     "__kernel void blur(__global unsigned char *out, __global const unsigned char *in,\n"
@@ -184,7 +184,7 @@ static char const *opencl_gaussian_blur =
     "    int const i = get_global_id(0);\n"
     "    int const j = get_global_id(1);\n"
     "    float val = 0, wsum = 0;\n"
-    "    if((i < w) && (j < h)) {"
+    "    if((i <= w) && (j <= h)) {"
     "        for(int channel_count = 0; (channel_count < nchannels); ++channel_count) {\n"
     "            for(int iter = 0; (iter < nchannels); ++iter) {\n"
     "                for(int iy = (j - significant_radius); (iy < j + significant_radius + 1); ++iy) {\n"
@@ -204,8 +204,6 @@ static char const *opencl_gaussian_blur =
     "    }\n"
     "}\n";
 
-// Calculates the weighted sum of two arrays, in1 and in2 according
-// to the formula: out(I) = saturate(in1(I)*alpha + in2(I)*beta + gamma)
 static char const *opencl_add_weighted =
     "__kernel void add_weighted(__global unsigned char *out,\n"
     "                           __global const unsigned char *in1, const float alpha,\n"
@@ -215,15 +213,21 @@ static char const *opencl_add_weighted =
     "    int y = get_global_id(1);\n"
     "    if((x < w) && (y < h)) {\n"
     "        unsigned byte_offset = (y * w + x) * nchannels;\n"
+    "        for(int i = 0; (i < nchannels); ++i) {\n"
+    "            float tmp = in1[byte_offset + i] * alpha + in2[byte_offset + i] * beta + gamma;\n"
+    "            out[byte_offset + i] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
+    "        }\n"
+#if 0
     "\n"
     "        float tmp = in1[byte_offset + 0] * alpha + in2[byte_offset + 0] * beta + gamma;\n"
+    "         tmp = in1[byte_offset + 1] * alpha + in2[byte_offset + 1] * beta + gamma;\n"
     "        out[byte_offset + 0] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
-    "\n"
-    "        tmp = in1[byte_offset + 1] * alpha + in2[byte_offset + 1] * beta + gamma;\n"
     "        out[byte_offset + 1] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
+    "\n"
     "\n"
     "        tmp = in1[byte_offset + 2] * alpha + in2[byte_offset + 2] * beta + gamma;\n"
     "        out[byte_offset + 2] = (char unsigned)(tmp < 0 ? 0 : tmp > UCHAR_MAX ? UCHAR_MAX : tmp);\n"
+#endif
     "    }\n"
     "}\n";
 
@@ -322,7 +326,7 @@ int main(int argc, char *argv[]) {
         char const *ifilename = "lena.ppm";
 
         i = 0;
-        blur_radius = 0;
+        blur_radius = 5;
         blur_times = 3;
 
         /*for(i = 0; (i < 5); )*/ {
