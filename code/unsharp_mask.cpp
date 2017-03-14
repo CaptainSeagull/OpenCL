@@ -6,6 +6,11 @@
 
 #include "ppm.hpp"
 
+//
+//
+//
+static bool use_gaussian_blur = true;
+
 struct OpenCLStuff {
     bool success;
     cl_context context;
@@ -118,7 +123,7 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
     // TODO(Jonny): Free opencl memory.
 }
 
-static char const *opencl_blur =
+static char const *opencl_original_blur =
     "__kernel void pixel_average(__global unsigned char *out,\n"
     "                            __global const unsigned char *in,\n"
     "                            const int x, const int y, const int blur_radius,\n"
@@ -152,6 +157,52 @@ static char const *opencl_blur =
     "    }\n"
     "}\n";
 
+#if 0
+From: http://blog.ivank.net/fastest-gaussian-blur.html
+// source channel, target channel, width, height, radius
+function gaussBlur_1 (scl, tcl, w, h, r) {
+    var rs = Math.ceil(r * 2.57);     // significant radius
+    for(var i=0; i<h; i++)
+        for(var j=0; j<w; j++) {
+            var val = 0, wsum = 0;
+            for(var iy = i-rs; iy<i+rs+1; iy++)
+                for(var ix = j-rs; ix<j+rs+1; ix++) {
+                    var x = Math.min(w-1, Math.max(0, ix));
+                    var y = Math.min(h-1, Math.max(0, iy));
+                    var dsq = (ix-j)*(ix-j)+(iy-i)*(iy-i);
+                    var wght = Math.exp( -dsq / (2*r*r) ) / (Math.PI*2*r*r);
+                    val += scl[y*w+x] * wght;  wsum += wght;
+                }
+            tcl[i*w+j] = Math.round(val/wsum);
+        }
+}
+#endif
+static char const *opencl_gaussian_blur =
+    "__kernel void blur(__global char unsigned *out, __global char unsigned *in,\n"
+    "                   int const blur_radius, int const w, int const h, int const nchannels) {\n"
+    "    int const significant_radius = ceil(blur_radius * 2.57f);     // significant radius\n"
+    "    int const i = get_global_id(0);\n"
+    "    int const j = get_global_id(1);\n"
+    "    float val = 0, wsum = 0;\n"
+    "    if((i < w) && (j < h)) {"
+    "        for(int channel_count = 0; (channel_count < nchannels); ++channel_count) {\n"
+    "            for(int iter = 0; (iter < nchannels); ++iter) {\n"
+    "                for(int iy = (j - significant_radius); (iy < j + significant_radius + 1); ++iy) {\n"
+    "                    for(int ix = (i - significant_radius); (ix < i + significant_radius + 1); ++ix) {\n"
+    "                        int x = min(w - 1, max(0, ix));\n"
+    "                        int y = min(h - 1, max(0, iy));\n"
+    "                        float dsq = (ix - i) * (ix - i) + (iy - j) * (iy - j);\n"
+    "                        float wght = exp( -dsq / (2 * blur_radius*blur_radius) ) / (M_PI * 2 * blur_radius*blur_radius);\n"
+    "                        val += in[y * w + x * nchannels] * wght;\n"
+    "                        wsum += wght;\n"
+    "                    }\n"
+    "                }\n"
+    "\n"
+    "                out[j * w + j * nchannels] = round(val / wsum);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n";
 
 // Calculates the weighted sum of two arrays, in1 and in2 according
 // to the formula: out(I) = saturate(in1(I)*alpha + in2(I)*beta + gamma)
@@ -222,7 +273,7 @@ static OpenCLStuff setup_opencl() {
     checkError(err, "Creating command queue");
 
     // Create the compute program from the source buffer
-    blur_program = clCreateProgramWithSource(res.context, 1, (const char **) &opencl_blur, NULL, &err);
+    blur_program = clCreateProgramWithSource(res.context, 1, (use_gaussian_blur) ? (const char **)&opencl_gaussian_blur : (const char **) &opencl_original_blur, NULL, &err);
     checkError(err, "Creating blur_program");
 
     // Build the blur_program
@@ -271,7 +322,7 @@ int main(int argc, char *argv[]) {
         char const *ifilename = "lena.ppm";
 
         i = 0;
-        blur_radius = 5;
+        blur_radius = 0;
         blur_times = 3;
 
         /*for(i = 0; (i < 5); )*/ {
