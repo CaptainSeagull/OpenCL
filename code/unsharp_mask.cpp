@@ -9,7 +9,7 @@
 //
 //
 //
-static bool use_gaussian_blur = false;
+static bool use_gaussian_blur = true;
 
 struct OpenCLStuff {
     bool success;
@@ -64,8 +64,11 @@ static void unsharp_mask(char unsigned  *out, char unsigned *in, int blur_radius
     //
 
     // Create a copy of the original image in GPU memory.
-    cl_mem gpu_in = clCreateBuffer(res.context, CL_MEM_READ_WRITE, size, 0, &err);  checkError(err, "Error allocating memory.");
-    err = clEnqueueWriteBuffer(res.commands, gpu_in, CL_TRUE, 0, size, in, 0, 0, 0); checkError(err, "Error copying original buffer from gpu to cpu");
+    cl_mem gpu_in = clCreateBuffer(res.context, CL_MEM_READ_WRITE, size, 0, &err);
+    checkError(err, "Error allocating memory.");
+
+    err = clEnqueueWriteBuffer(res.commands, gpu_in, CL_TRUE, 0, size, in, 0, 0, 0);
+    checkError(err, "Error copying original buffer from gpu to cpu");
 
     // Allocate memory for the swap buffers.
     cl_mem blur1 = clCreateBuffer(res.context, CL_MEM_READ_WRITE, size, 0, &err); checkError(err, "Creating blur buffer 1");
@@ -130,18 +133,18 @@ static char const *opencl_original_blur =
     "                            int const w, int const h, int const nchannels) {\n"
     "    float total[4] = {0, 0, 0, 0};\n"
     "    int const nsamples = (blur_radius*2-1) * (blur_radius*2-1);\n"
+    "    int const byte_offset;\n"
     "    for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {\n"
     "        for(int i = x-blur_radius+1; i < x+blur_radius; ++i) {\n"
     "            int const r_i = i < 0 ? 0 : i >= w ? w-1 : i;\n"
     "            int const r_j = j < 0 ? 0 : j >= h ? h-1 : j;\n"
-    "            int const byte_offset = (r_j*w+r_i)*nchannels;\n"
+    "            byte_offset = (r_j*w+r_i)*nchannels;\n"
     "            for(int channel_index = 0; (channel_index < nchannels); ++channel_index) {\n"
     "                total[channel_index] += in[byte_offset + channel_index];\n"
     "            }\n"
     "        }\n"
     "    }\n"
     "\n"
-    "    int const byte_offset = (y*w+x)*nchannels;\n"
     "    for(int channel_index = 0; (channel_index < nchannels); ++channel_index) {\n"
     "        out[byte_offset + channel_index] = (char unsigned)(total[channel_index] / nsamples);\n"
     "    }\n"
@@ -177,27 +180,33 @@ function gaussBlur_1 (scl, tcl, w, h, r) {
         }
 }
 #endif
+
 static char const *opencl_gaussian_blur =
     "__kernel void blur(__global char unsigned *out, __global char unsigned *in,\n"
-    "                   int const blur_radius, int const w, int const h, int const nchannels) {\n"
-    "    int const significant_radius = ceil(blur_radius * 2.57f);     // significant radius\n"
-    "    int const i = get_global_id(0);\n"
-    "    int const j = get_global_id(1);\n"
-    "    float val = 0, wsum = 0;\n"
-    "    if((i <= w) && (j <= h)) {"
-    "        for(int iter = 0; (iter < nchannels); ++iter) {\n"
-    "            for(int iy = (j - significant_radius); (iy < j + significant_radius + 1); ++iy) {\n"
-    "                for(int ix = (i - significant_radius); (ix < i + significant_radius + 1); ++ix) {\n"
-    "                    int x = min(w - 1, max(0, ix));\n"
-    "                    int y = min(h - 1, max(0, iy));\n"
-    "                    float dsq = (ix - i) * (ix - i) + (iy - j) * (iy - j);\n"
-    "                    float wght = exp( -dsq / (2 * blur_radius*blur_radius) ) / (M_PI * 2 * blur_radius*blur_radius);\n"
-    "                    val += in[y * w + x * nchannels] * wght;\n"
-    "                    wsum += wght;\n"
+    "                   int const blur_radius, int const width, int const height, int const nchannels) {\n"
+    "    int const x_pixel = get_global_id(0);\n"
+    "    int const h_pixel = get_global_id(1);\n"
+    "    if((h_pixel <= height) && (x_pixel <= width)) {\n"
+    "        int byte_offset;\n"
+    "        int const significant_radius = ceil(blur_radius * 2.57f);\n"
+    "        float val[4] = {0, 0, 0, 0};\n"
+    "        float weighted_sum[4] = {0, 0, 0, 0};\n"
+    "        for(int y_index = (h_pixel - significant_radius); (y_index < h_pixel + significant_radius + 1); ++y_index) {\n"
+    "            for(int x_index = (x_pixel - significant_radius); (x_index < x_pixel + significant_radius + 1); ++x_index) {\n"
+    "                int x = min(width - 1, max(0, x_index));\n"
+    "                int y = min(height - 1, max(0, y_index));\n"
+    "                byte_offset = (y * width + x) * nchannels;\n"
+    "                float dsq = (x_index - x_pixel) * (x_index - x_pixel) + (y_index - h_pixel) * (y_index - h_pixel);\n"
+    "                float weight = exp(-dsq / (2 * blur_radius*blur_radius) ) / (M_PI * 2 * blur_radius*blur_radius);\n"
+    "                for(int channel_index = 0; (channel_index < nchannels); ++channel_index) {\n"
+    "                    val[channel_index] += in[byte_offset + channel_index] * weight;\n"
+    "                    weighted_sum[channel_index] += weight;\n"
     "                }\n"
     "            }\n"
+    "        }\n"
     "\n"
-    "            out[j * w + j * nchannels] = round(val / wsum);\n"
+    "        for(int channel_index = 0; (channel_index < nchannels); ++channel_index) {\n"
+    "            out[byte_offset + channel_index] = round(val[channel_index] / weighted_sum[channel_index]);\n"
     "        }\n"
     "    }\n"
     "}\n";
@@ -264,7 +273,9 @@ static OpenCLStuff setup_opencl() {
     checkError(err, "Creating command queue");
 
     // Create the compute program from the source buffer
-    blur_program = clCreateProgramWithSource(res.context, 1, (use_gaussian_blur) ? (const char **)&opencl_gaussian_blur : (const char **) &opencl_original_blur, NULL, &err);
+    blur_program = clCreateProgramWithSource(res.context, 1,
+                                             (use_gaussian_blur) ? (const char **)&opencl_gaussian_blur : (const char **)&opencl_original_blur,
+                                             NULL, &err);
     checkError(err, "Creating blur_program");
 
     // Build the blur_program
