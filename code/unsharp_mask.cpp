@@ -9,7 +9,7 @@
 //
 //
 //
-static bool use_gaussian_blur = true;
+static bool use_gaussian_blur = false;
 
 struct OpenCLStuff {
     bool success;
@@ -133,7 +133,7 @@ static char const *opencl_original_blur =
     "                            int const w, int const h, int const nchannels) {\n"
     "    float total[4] = {0, 0, 0, 0};\n"
     "    int const nsamples = (blur_radius*2-1) * (blur_radius*2-1);\n"
-    "    int const byte_offset;\n"
+    "    int byte_offset;\n"
     "    for(int j = y-blur_radius+1; j < y+blur_radius; ++j) {\n"
     "        for(int i = x-blur_radius+1; i < x+blur_radius; ++i) {\n"
     "            int const r_i = i < 0 ? 0 : i >= w ? w-1 : i;\n"
@@ -317,7 +317,7 @@ static OpenCLStuff setup_opencl() {
 int main(int argc, char *argv[]) {
     OpenCLStuff res = setup_opencl();
     if(res.success) {
-        char const *ifilename = "lena.ppm";
+        char const *ifilename = "ghost-town-8k.ppm";
 
         int blur_radius = 5;
         int blur_times = 3;
@@ -331,12 +331,14 @@ int main(int argc, char *argv[]) {
         img.read(ifilename, data_in);
         data_sharp.resize(img.w * img.h * img.nchannels);
 
-        auto t1 = std::chrono::steady_clock::now();
 
+        auto t1 = std::chrono::steady_clock::now();
         unsharp_mask(data_sharp.data(), data_in.data(), blur_radius,
                      img.w, img.h, img.nchannels, res, blur_times);
-
         auto t2 = std::chrono::steady_clock::now();
+        auto diff = t2 - t1;
+        std::cout << std::chrono::duration<double, std::milli> (diff).count();
+
         std::string ofilename = "out.ppm";
         img.write(ofilename.c_str(), data_sharp);
     }
