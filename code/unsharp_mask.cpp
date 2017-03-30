@@ -160,27 +160,7 @@ static char const *opencl_original_blur =
     "    }\n"
     "}\n";
 
-#if 0
-From: http://blog.ivank.net/fastest-gaussian-blur.html
-// source channel, target channel, width, height, radius
-function gaussBlur_1 (scl, tcl, w, h, r) {
-    var rs = Math.ceil(r * 2.57);     // significant radius
-    for(var i=0; i<h; i++)
-        for(var j=0; j<w; j++) {
-            var val = 0, wsum = 0;
-            for(var iy = i-rs; iy<i+rs+1; iy++)
-                for(var ix = j-rs; ix<j+rs+1; ix++) {
-                    var x = Math.min(w-1, Math.max(0, ix));
-                    var y = Math.min(h-1, Math.max(0, iy));
-                    var dsq = (ix-j)*(ix-j)+(iy-i)*(iy-i);
-                    var wght = Math.exp( -dsq / (2*r*r) ) / (Math.PI*2*r*r);
-                    val += scl[y*w+x] * wght;  wsum += wght;
-                }
-            tcl[i*w+j] = Math.round(val/wsum);
-        }
-}
-#endif
-
+// From: http://blog.ivank.net/fastest-gaussian-blur.html
 static char const *opencl_gaussian_blur =
     "__kernel void blur(__global char unsigned *out, __global char unsigned *in,\n"
     "                   int const blur_radius, int const width, int const height, int const nchannels) {\n"
@@ -336,8 +316,7 @@ int main(int argc, char *argv[]) {
         unsharp_mask(data_sharp.data(), data_in.data(), blur_radius,
                      img.w, img.h, img.nchannels, res, blur_times);
         auto t2 = std::chrono::steady_clock::now();
-        auto diff = t2 - t1;
-        std::cout << std::chrono::duration<double, std::milli> (diff).count();
+        std::cout << std::chrono::duration<double>(t2-t1).count() << " seconds.\n";
 
         std::string ofilename = "out.ppm";
         img.write(ofilename.c_str(), data_sharp);
